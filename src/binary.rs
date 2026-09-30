@@ -76,6 +76,132 @@ pub struct BinaryProcessor {
     format: ObjectFormat,
 }
 
+const PAGE_SIZE: u64 = 0x1000;
+
+#[derive(Debug, Clone, Copy)]
+struct ElfSegment {
+    p_type: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+    /// Offset of the p_filesz field itself, so it can be updated in place.
+    filesz_field: usize,
+    is_64: bool,
+}
+
+impl ElfSegment {
+    /// Virtual address for a file offset inside this segment, if it covers it.
+    fn vaddr_of_offset(&self, offset: u64) -> Option<u64> {
+        (self.offset <= offset && offset < self.offset + self.filesz)
+            .then(|| self.vaddr + (offset - self.offset))
+    }
+}
+
+fn round_up(value: u64, align: u64) -> u64 {
+    (value + align - 1) & !(align - 1)
+}
+
+fn read_u16(data: &[u8], at: usize) -> Result<u16> {
+    let bytes = data.get(at..at + 2).context("Truncated ELF header")?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(data: &[u8], at: usize) -> Result<u32> {
+    let bytes = data.get(at..at + 4).context("Truncated ELF header")?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64(data: &[u8], at: usize) -> Result<u64> {
+    let bytes = data.get(at..at + 8).context("Truncated ELF header")?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn write_elf_word(data: &mut [u8], at: usize, value: u64, is_64: bool) -> Result<()> {
+    if is_64 {
+        data.get_mut(at..at + 8)
+            .context("Truncated ELF program header")?
+            .copy_from_slice(&value.to_le_bytes());
+    } else {
+        let narrowed = u32::try_from(value).context("Value does not fit in a 32-bit ELF")?;
+        data.get_mut(at..at + 4)
+            .context("Truncated ELF program header")?
+            .copy_from_slice(&narrowed.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Reads the PT_LOAD entries of a 32- or 64-bit little-endian ELF.
+fn elf_load_segments(data: &[u8]) -> Result<Vec<ElfSegment>> {
+    if data.get(..4) != Some(b"\x7fELF") {
+        return Err(anyhow::anyhow!("Payload is not an ELF file"));
+    }
+    let class = *data.get(4).context("Truncated ELF header")?;
+    let endian = *data.get(5).context("Truncated ELF header")?;
+    if endian != 1 {
+        return Err(anyhow::anyhow!("Only little-endian ELF payloads are supported"));
+    }
+    let is_64 = match class {
+        1 => false,
+        2 => true,
+        other => return Err(anyhow::anyhow!("Unsupported ELF class {other}")),
+    };
+
+    let (phoff, phnum, stride) = if is_64 {
+        (
+            read_u64(data, 0x20)?,
+            read_u16(data, 0x38)? as usize,
+            read_u16(data, 0x36)? as usize,
+        )
+    } else {
+        (
+            read_u32(data, 0x1c)? as u64,
+            read_u16(data, 0x2c)? as usize,
+            read_u16(data, 0x2a)? as usize,
+        )
+    };
+
+    let mut segments = Vec::with_capacity(phnum);
+    for index in 0..phnum {
+        let base = phoff as usize + index * stride;
+        let (p_type, flags, offset, vaddr, filesz, memsz, filesz_field) = if is_64 {
+            (
+                read_u32(data, base)?,
+                read_u32(data, base + 4)?,
+                read_u64(data, base + 8)?,
+                read_u64(data, base + 16)?,
+                read_u64(data, base + 32)?,
+                read_u64(data, base + 40)?,
+                base + 32,
+            )
+        } else {
+            (
+                read_u32(data, base)?,
+                read_u32(data, base + 24)?,
+                read_u32(data, base + 4)? as u64,
+                read_u32(data, base + 8)? as u64,
+                read_u32(data, base + 16)? as u64,
+                read_u32(data, base + 20)? as u64,
+                base + 16,
+            )
+        };
+        segments.push(ElfSegment {
+            p_type,
+            flags,
+            offset,
+            vaddr,
+            filesz,
+            memsz,
+            filesz_field,
+            is_64,
+        });
+    }
+    Ok(segments)
+}
+
 impl BinaryProcessor {
     pub fn new(data: Vec<u8>) -> Result<Self> {
         // `File::parse` rejects universal binaries with a generic
@@ -140,114 +266,7 @@ impl BinaryProcessor {
 
         match self.format {
             ObjectFormat::Elf => {
-                let data_cloned = self.data.clone();
-                let elf = object::build::elf::Builder::read(data_cloned.as_slice())?;
-                self.data = vec![];
-                // re-write ELF to ensure segments are properly aligned
-                elf.write(&mut self.data)?;
-                let data_cloned = self.data.clone();
-                let mut elf = object::build::elf::Builder::read(data_cloned.as_slice())?;
-                let vaddr_spare_area = elf
-                    .segments
-                    .iter()
-                    .map(|seg| seg.p_vaddr + seg.p_memsz)
-                    .max()
-                    .unwrap_or(0);
-
-                let vaddr_spare_area = (vaddr_spare_area + 0xfff) & !0xfff;
-                info!("vaddr_spare_area: {vaddr_spare_area:#x}");
-
-                let mut offset_spare_area = self.data.len() as u64;
-
-                let fripack_section_id = {
-                    let new_segment = elf.segments.add_load_segment(PF_R | PF_W, 4096);
-                    let new_section = elf.sections.add();
-
-                    offset_spare_area = (offset_spare_area + 0xfff) & !0xfff;
-
-                    new_section.sh_size = data.len() as u64;
-                    new_section.data = object::build::elf::SectionData::Data(data.into());
-                    new_section.sh_flags = (object::elf::SHF_ALLOC | object::elf::SHF_WRITE) as u64;
-                    new_section.sh_type = object::elf::SHT_PROGBITS;
-                    new_section.sh_addralign = 4096;
-                    new_section.sh_offset = offset_spare_area;
-                    new_section.sh_addr = vaddr_spare_area;
-                    new_segment.p_vaddr = vaddr_spare_area;
-                    new_segment.append_section(new_section);
-                    new_section.sh_addr = vaddr_spare_area;
-                    new_segment.p_vaddr = vaddr_spare_area;
-                    offset_spare_area += new_section.sh_size;
-                    offset_spare_area = (offset_spare_area + 0xfff) & !0xfff;
-
-                    new_section.id()
-                };
-
-                let header_size = elf.file_header_size() as u64 + elf.program_headers_size() as u64;
-                // move sections overlapped with the header to the end of file
-                for section in elf.sections.iter_mut() {
-                    if section.sh_offset < header_size {
-                        info!("Moving section {}", section.name);
-                        section.sh_offset = offset_spare_area;
-                        offset_spare_area = (section.sh_offset + section.sh_size + 0xfff) & !0xfff;
-                    }
-                }
-
-                let size = elf.program_headers_size() as u64;
-
-                let size_diff = if let Some(phdr_segment) =
-                    elf.segments.iter_mut().find(|seg| seg.p_type == PT_PHDR)
-                {
-                    let size_diff = size - phdr_segment.p_filesz;
-                    phdr_segment.p_filesz = size;
-                    phdr_segment.p_memsz = size;
-                    size_diff
-                } else {
-                    size
-                };
-
-                let header_load_segment = elf
-                    .segments
-                    .iter_mut()
-                    .find(|seg| seg.p_type == PT_LOAD && seg.p_offset == 0)
-                    .context("Failed to find PT_LOAD segment covering header (p_offset == 0)")?;
-
-                header_load_segment.p_filesz += size_diff;
-                header_load_segment.p_memsz += size_diff;
-
-                self.data = vec![];
-                elf.write(&mut self.data)?;
-                let data_cloned = self.data.clone();
-                let elf = object::build::elf::Builder::read(data_cloned.as_slice())?;
-                // update embedded config offset
-                let embedded_config_offset = self
-                    .find_embedded_config()
-                    .context("Failed to find embedded config after adding data")?;
-
-                let data_section_segment = elf
-                    .segments
-                    .iter()
-                    .find(|seg| {
-                        seg.p_offset <= embedded_config_offset as u64
-                            && (embedded_config_offset as u64) < seg.p_offset + seg.p_filesz
-                    })
-                    .context("Failed to find data segment")?;
-
-                let fripack_section_segment = elf
-                    .segments
-                    .iter()
-                    .find(|seg| seg.sections.contains(&fripack_section_id))
-                    .context("Failed to find fripack_config segment")?;
-
-                embedded_config.data_offset = (fripack_section_segment.p_offset as i32
-                    - embedded_config_offset as i32)
-                    - (fripack_section_segment.p_offset as i32
-                        - data_section_segment.p_offset as i32)
-                    + (fripack_section_segment.p_vaddr as i32
-                        - data_section_segment.p_vaddr as i32);
-                let embedded_config_bytes = embedded_config.as_bytes();
-                self.data
-                    [embedded_config_offset..embedded_config_offset + embedded_config_bytes.len()]
-                    .copy_from_slice(&embedded_config_bytes);
+                self.patch_elf(&data, &mut embedded_config, use_xz)?;
             }
             ObjectFormat::Pe => {
                 // Parse the PE file
@@ -380,6 +399,98 @@ impl BinaryProcessor {
             .take(len)
             .map(char::from)
             .collect()
+    }
+
+    /// Writes the embedded config into an ELF payload using byte writes only.
+    ///
+    /// The program header table and the section header table are left exactly as
+    /// they were; an existing PT_LOAD simply has its p_filesz grown to cover the
+    /// appended data.
+    ///
+    /// The previous implementation asked the ELF builder to append a section and a
+    /// PT_LOAD for the payload. Adding a program header makes the program header
+    /// table one entry longer, and in fripack-inject's Linux payload that table
+    /// ends exactly where .dynsym begins - both at 0x238, with no gap - so the new
+    /// entry landed on top of the first two dynamic symbols. The code noticed the
+    /// overlap and "moved" the section, but it only rewrote the section header's
+    /// sh_offset: the bytes were never copied and DT_SYMTAB still pointed at the
+    /// old address, which is where the program header table now lived. The loader
+    /// duly relocated against a corrupted symbol - measured dynsym[1].st_value ==
+    /// 0x78 - and jumped to base + 0x78, segfaulting before the payload's
+    /// constructor ever ran.
+    fn patch_elf(
+        &mut self,
+        data: &[u8],
+        embedded_config: &mut EmbeddedConfig,
+        use_xz: bool,
+    ) -> Result<()> {
+        let segments = elf_load_segments(self.data.as_slice())?;
+
+        let config_offset = self
+            .find_embedded_config()
+            .context("Embedded config not found in the ELF payload")?;
+        let config_vaddr = segments
+            .iter()
+            .find_map(|seg| seg.vaddr_of_offset(config_offset as u64))
+            .context("Embedded config is not covered by any PT_LOAD segment")?;
+
+        // Park the data in the tail of a writable segment that has memory beyond
+        // its file contents (a .bss), past the end of the file so that appending
+        // cannot overwrite anything.
+        let file_len = self.data.len() as u64;
+        let mut chosen: Option<(ElfSegment, u64, u64)> = None;
+        for seg in segments.iter() {
+            if seg.p_type != PT_LOAD || seg.flags & PF_W == 0 {
+                continue;
+            }
+            let after_eof = file_len.saturating_sub(seg.offset);
+            let delta = round_up(seg.filesz.max(after_eof), PAGE_SIZE);
+            let new_filesz = delta + data.len() as u64;
+            if new_filesz > seg.memsz {
+                continue; // would not fit in the segment's memory
+            }
+            // Prefer the tightest fit so the appended data stays close to its segment.
+            if chosen
+                .as_ref()
+                .is_none_or(|(_, _, best_filesz)| new_filesz < *best_filesz)
+            {
+                chosen = Some((seg.clone(), delta, new_filesz));
+            }
+        }
+        let (segment, delta, new_filesz) = chosen.context(
+            "No writable PT_LOAD segment has room for the embedded script; the payload \
+             needs a segment whose memory size exceeds its file size (a .bss)",
+        )?;
+
+        let data_vaddr = segment.vaddr + delta;
+        let write_at = (segment.offset + delta) as usize;
+        if self.data.len() < write_at {
+            self.data.resize(write_at, 0);
+        }
+        self.data.extend_from_slice(data);
+
+        write_elf_word(
+            &mut self.data,
+            segment.filesz_field,
+            new_filesz,
+            segment.is_64,
+        )?;
+
+        embedded_config.data_size = data.len() as i32;
+        embedded_config.data_offset = (data_vaddr - config_vaddr) as i32;
+        embedded_config.data_xz = use_xz;
+
+        let config_bytes = embedded_config.as_bytes();
+        self.data[config_offset..config_offset + config_bytes.len()]
+            .copy_from_slice(&config_bytes);
+
+        let data_offset = embedded_config.data_offset;
+        info!(
+            "Patched ELF: data_offset={data_offset:#x} (config@{config_offset:#x} \
+             vaddr={config_vaddr:#x}, data@{data_vaddr:#x}, p_filesz {:#x} -> {new_filesz:#x})",
+            segment.filesz
+        );
+        Ok(())
     }
 
     pub fn anti_anti_frida(&mut self) -> Result<()> {
