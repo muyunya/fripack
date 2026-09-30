@@ -85,6 +85,9 @@ pub struct BinaryProcessor {
 
 const PAGE_SIZE: u64 = 0x1000;
 
+/// Sentinel in e_shstrndx meaning "the real index is in section 0's sh_link".
+const SHN_XINDEX: usize = 0xffff;
+
 #[derive(Debug, Clone, Copy)]
 struct ElfSegment {
     p_type: u32,
@@ -180,7 +183,7 @@ struct ElfSection {
 /// Reads the section header table of a 32- or 64-bit little-endian ELF.
 fn elf_sections(data: &[u8]) -> Result<Vec<ElfSection>> {
     let is_64 = elf_is_64(data)?;
-    let (shoff, shentsize, shnum, shstrndx) = if is_64 {
+    let (shoff, shentsize, mut shnum, mut shstrndx) = if is_64 {
         (
             read_u64(data, 0x28)? as usize,
             read_u16(data, 0x3a)? as usize,
@@ -216,6 +219,20 @@ fn elf_sections(data: &[u8]) -> Result<Vec<ElfSection>> {
             )
         })
     };
+
+    // Two extended forms keep the real value in section header 0: e_shnum == 0 means
+    // the count is in its sh_size, and e_shstrndx == SHN_XINDEX means the string
+    // table index is in its sh_link. Both are legal in a large ELF file, and a
+    // payload that uses them would otherwise look like it has no sections at all.
+    if shnum == 0 || shstrndx == SHN_XINDEX {
+        let (_, _, section0_size, section0_link, _) = fields(0)?;
+        if shnum == 0 {
+            shnum = section0_size as usize;
+        }
+        if shstrndx == SHN_XINDEX {
+            shstrndx = section0_link as usize;
+        }
+    }
 
     // Section names live in the section named by e_shstrndx.
     let (_, strtab_offset, strtab_size, _, _) = fields(shstrndx)?;
@@ -623,13 +640,24 @@ impl BinaryProcessor {
 
         // It also has to be file-backed and mapped, or there is nowhere to write the
         // script and nothing for the payload to read.
+        // The *whole* buffer has to be file-backed, not just its first byte. Checking
+        // only the start would let a buffer whose tail runs into a segment's
+        // zero-filled part through: the script would be written to the file, and the
+        // payload would read zeros back at runtime - a silent failure rather than a
+        // loud one.
         let reserved_offset = segments
             .iter()
-            .find_map(|segment| segment.offset_of_vaddr(reserved_vaddr))
+            .find_map(|segment| {
+                (segment.vaddr <= reserved_vaddr
+                    && reserved_vaddr + data.len() as u64 <= segment.vaddr + segment.filesz)
+                    .then(|| segment.offset + (reserved_vaddr - segment.vaddr))
+            })
             .with_context(|| {
                 format!(
-                    "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' at {reserved_vaddr:#x} is not in \
-                     the file-backed part of any PT_LOAD segment (is it in .bss?)"
+                    "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' at {reserved_vaddr:#x} does not \
+                     have {:#x} bytes of file-backed space inside a single PT_LOAD segment (is it \
+                     in .bss, or does it run past the segment's file contents?)",
+                    data.len()
                 )
             })?;
 
@@ -1040,11 +1068,17 @@ mod tests {
             .expect("fixture must export the reserved buffer");
         assert_eq!(size, 65536);
         let segments = elf_load_segments(ELF_FIXTURE).unwrap();
+        // The whole buffer, not just its first byte: a tail running into a segment's
+        // zero-filled part would let the patcher write the script to the file and the
+        // payload read zeros back at runtime.
+        let fully_backed = segments.iter().any(|segment| {
+            segment.vaddr <= vaddr && vaddr + size <= segment.vaddr + segment.filesz
+        });
         assert!(
-            segments
-                .iter()
-                .any(|segment| segment.offset_of_vaddr(vaddr).is_some()),
-            "reserved buffer at {vaddr:#x} has no file-backed home"
+            fully_backed,
+            "reserved buffer at {vaddr:#x} (+{size:#x}) is not wholly file-backed; \
+             a buffer in .bss, or one running past the segment's file contents, cannot \
+             carry a script"
         );
     }
 
