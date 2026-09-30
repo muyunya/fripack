@@ -134,21 +134,108 @@ fn write_elf_word(data: &mut [u8], at: usize, value: u64, is_64: bool) -> Result
     Ok(())
 }
 
+/// True for a 64-bit little-endian ELF, false for 32-bit.
+fn elf_is_64(data: &[u8]) -> Result<bool> {
+    if data.get(..4) != Some(b"\x7fELF") {
+        return Err(anyhow::anyhow!("Payload is not an ELF file"));
+    }
+    if data.get(5) != Some(&1) {
+        return Err(anyhow::anyhow!(
+            "Only little-endian ELF payloads are supported"
+        ));
+    }
+    match data.get(4) {
+        Some(1) => Ok(false),
+        Some(2) => Ok(true),
+        other => Err(anyhow::anyhow!("Unsupported ELF class {other:?}")),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ElfSection {
+    name: String,
+    offset: u64,
+    size: u64,
+    /// Index of the linked section, which is how .dynsym points at .dynstr.
+    link: u32,
+    entsize: u64,
+}
+
+/// Reads the section header table of a 32- or 64-bit little-endian ELF.
+fn elf_sections(data: &[u8]) -> Result<Vec<ElfSection>> {
+    let is_64 = elf_is_64(data)?;
+    let (shoff, shentsize, shnum, shstrndx) = if is_64 {
+        (
+            read_u64(data, 0x28)? as usize,
+            read_u16(data, 0x3a)? as usize,
+            read_u16(data, 0x3c)? as usize,
+            read_u16(data, 0x3e)? as usize,
+        )
+    } else {
+        (
+            read_u32(data, 0x20)? as usize,
+            read_u16(data, 0x2e)? as usize,
+            read_u16(data, 0x30)? as usize,
+            read_u16(data, 0x32)? as usize,
+        )
+    };
+
+    let fields = |index: usize| -> Result<(u32, u64, u64, u32, u64)> {
+        let base = shoff + index * shentsize;
+        Ok(if is_64 {
+            (
+                read_u32(data, base)?,
+                read_u64(data, base + 24)?,
+                read_u64(data, base + 32)?,
+                read_u32(data, base + 40)?,
+                read_u64(data, base + 56)?,
+            )
+        } else {
+            (
+                read_u32(data, base)?,
+                read_u32(data, base + 16)? as u64,
+                read_u32(data, base + 20)? as u64,
+                read_u32(data, base + 24)?,
+                read_u32(data, base + 36)? as u64,
+            )
+        })
+    };
+
+    // Section names live in the section named by e_shstrndx.
+    let (_, strtab_offset, strtab_size, _, _) = fields(shstrndx)?;
+    let names = (strtab_offset as usize)..(strtab_offset + strtab_size) as usize;
+
+    let mut sections = Vec::with_capacity(shnum);
+    for index in 0..shnum {
+        let (name_offset, offset, size, link, entsize) = fields(index)?;
+        let start = names.start + name_offset as usize;
+        let name = if names.contains(&start) && data.len() > start {
+            let end = data[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|n| start + n)
+                .unwrap_or(data.len());
+            String::from_utf8_lossy(&data[start..end]).into_owned()
+        } else {
+            String::new()
+        };
+        sections.push(ElfSection {
+            name,
+            offset,
+            size,
+            link,
+            entsize,
+        });
+    }
+    Ok(sections)
+}
+
 /// Reads the PT_LOAD entries of a 32- or 64-bit little-endian ELF.
 fn elf_load_segments(data: &[u8]) -> Result<Vec<ElfSegment>> {
     if data.get(..4) != Some(b"\x7fELF") {
         return Err(anyhow::anyhow!("Payload is not an ELF file"));
     }
-    let class = *data.get(4).context("Truncated ELF header")?;
-    let endian = *data.get(5).context("Truncated ELF header")?;
-    if endian != 1 {
-        return Err(anyhow::anyhow!("Only little-endian ELF payloads are supported"));
-    }
-    let is_64 = match class {
-        1 => false,
-        2 => true,
-        other => return Err(anyhow::anyhow!("Unsupported ELF class {other}")),
-    };
+    let is_64 = elf_is_64(data)?;
 
     let (phoff, phnum, stride) = if is_64 {
         (
@@ -495,27 +582,39 @@ impl BinaryProcessor {
 
     pub fn anti_anti_frida(&mut self) -> Result<()> {
         if let ObjectFormat::Elf = self.format {
-            let cloned_data = self.data.clone();
-            let obj = object::build::elf::Builder::read(cloned_data.as_slice())?;
+            let sections = elf_sections(self.data.as_slice())?;
             let rodata_section_range = {
-                let rodata_section = obj
-                    .sections
+                let rodata = sections
                     .iter()
-                    .find(|sec| sec.name == ".rodata".into())
+                    .find(|section| section.name == ".rodata")
                     .context("Failed to find .rodata section")?;
-                (rodata_section.sh_offset as usize)
-                    ..(rodata_section.sh_offset as usize + rodata_section.sh_size as usize)
+                (rodata.offset as usize)..((rodata.offset + rodata.size) as usize)
             };
 
-            let dynstr_section_range = {
-                let dynstr_section = obj
-                    .sections
-                    .iter()
-                    .find(|sec| sec.name == ".dynstr".into())
-                    .context("Failed to find .dynstr section")?;
-                (dynstr_section.sh_offset as usize)
-                    ..(dynstr_section.sh_offset as usize + dynstr_section.sh_size as usize)
-            };
+            // .dynstr is not rewritten at all.
+            //
+            // Renaming a symbol name there breaks loading, and it took three layers
+            // of this to find out. The loader resolves the library's own dynamic
+            // relocations by looking symbols up *by name* through .gnu.hash, and
+            // that table was built from the original names, so a renamed symbol
+            // cannot be found and the load fails:
+            //
+            //     dlopen FAILED: undefined symbol: _uYhIZ_ffi_type_pointer
+            //
+            // Restricting the rewrite to defined symbols does not help - the symbol
+            // in that error is defined (st_shndx = 10) and is still reported as
+            // undefined - and restricting it to imports would break resolution
+            // against libffi instead. Rebuilding .gnu.hash properly would mean
+            // reordering .dynsym, since the format requires symbols to be sorted by
+            // bucket, which is far more invasive than this pass is worth.
+            //
+            // The earlier code did rewrite .dynstr and claimed the rebuild that
+            // followed fixed GNU_HASH. It did not: delete_orphan_dynamics,
+            // delete_orphan_symbols and set_section_sizes never touch the hash
+            // table.
+            //
+            // What .rodata still covers is what detection actually scans for, the
+            // frida/gum strings the engine carries around.
 
             let mut replacements = 0;
 
@@ -568,16 +667,21 @@ impl BinaryProcessor {
                 // Use a sliding window approach with memchr for faster searching
                 let mut pos = 0;
                 while let Some(offset) = memchr::memmem::find(&self.data[pos..], keyword_bytes) {
-                    if !dynstr_section_range.contains(&(pos + offset))
-                        && !(rodata_section_range.contains(&(pos + offset))
-                            && keywords_rodata
-                                .contains(&std::str::from_utf8(keyword_bytes).unwrap()))
-                    {
+                    let i = pos + offset;
+                    let last = i + keyword_bytes.len() - 1;
+
+                    // Rewrites happen in .rodata only. Symbol names in .dynstr are
+                    // deliberately left alone - see the note above the keyword list.
+                    let in_rodata = rodata_section_range.contains(&i)
+                        && rodata_section_range.contains(&last)
+                        && keywords_rodata
+                            .contains(&std::str::from_utf8(keyword_bytes).unwrap());
+
+                    if !in_rodata {
                         pos += offset + keyword_bytes.len();
                         continue;
                     }
 
-                    let i = pos + offset;
                     self.data[i..i + keyword_bytes.len()].copy_from_slice(replace_bytes);
                     replacements += 1;
                     pos = i + keyword_bytes.len();
