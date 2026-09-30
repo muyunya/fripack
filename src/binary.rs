@@ -297,7 +297,13 @@ fn elf_symbol(data: &[u8], wanted: &str) -> Result<Option<(u64, u64)>> {
             .position(|&b| b == 0)
             .map(|n| start + n)
             .unwrap_or(strings_end);
-        if &data[start..end] == wanted.as_bytes() {
+        let found = &data[start..end];
+        // Accept the plain name as well as a C++-mangled one that ends with it: a
+        // payload declaring the buffer inside a namespace exports
+        // _ZN7fripack6config17g_fripack_payloadE, and that is just as good.
+        if found == wanted.as_bytes()
+            || (found.starts_with(b"_Z") && found.ends_with(wanted.as_bytes()))
+        {
             return Ok(Some((value, size)));
         }
     }
