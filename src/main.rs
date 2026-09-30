@@ -121,15 +121,14 @@ fn load_config(path: &PathBuf, watch_mode: bool) -> Result<ResolvedConfig> {
     let config_content = std::fs::read_to_string(path)?;
     let config: FripackConfig = json5::from_str(&config_content)?;
     let mut resolved_config = config.resolve_inheritance()?;
-    resolved_config
-        .targets
-        .values_mut()
-        .for_each(|target| {
-            target.watch_mode = watch_mode;
-            if watch_mode {
-                target.push_path.get_or_insert_with(|| "/data/local/tmp/fripack_dev.js".to_string());
-            }
-        });
+    resolved_config.targets.values_mut().for_each(|target| {
+        target.watch_mode = watch_mode;
+        if watch_mode {
+            target
+                .push_path
+                .get_or_insert_with(|| "/data/local/tmp/fripack_dev.js".to_string());
+        }
+    });
     Ok(resolved_config)
 }
 
@@ -267,7 +266,14 @@ async fn rebuild_install_target(
     target_config: &config::ResolvedTarget,
 ) -> Result<()> {
     let mut builder = Builder::new();
-    let output_path = builder.build_target(&target, target_config).await?.unwrap();
+    // build_target returns None for a target without a `type`, which it warns
+    // about and skips - not a reason to panic.
+    let output_path = builder
+        .build_target(target, target_config)
+        .await?
+        .with_context(|| {
+            format!("Target '{target}' has no `type`, so there is nothing to build")
+        })?;
 
     if target_config.target_type.as_deref() == Some("xposed") {
         info!("→ Installing APK to device...");
@@ -298,13 +304,26 @@ async fn update_target(
         info!("→ Configuration changed, rebuilding the target...");
         rebuild_install_target(target, target_config).await?;
     }
-    let entry = target_config.entry.as_ref().unwrap();
-    if Path::new(entry).exists() && target_config.platform.as_ref().unwrap().platform == Platform::Android {
+    // Watch mode is useful for targets that only have a watchPath, so these are
+    // all optional. They used to be unwrapped, which turned a configuration that
+    // merely omitted them into a panic.
+    let Some(entry) = target_config.entry.as_ref() else {
+        return Ok(());
+    };
+    let is_android = target_config
+        .platform
+        .as_ref()
+        .is_some_and(|platform| platform.platform == Platform::Android);
+    if Path::new(entry).exists() && is_android {
+        let Some(push_path) = target_config.push_path.as_ref() else {
+            warn!("Target has no `pushPath`; skipping the push to the device");
+            return Ok(());
+        };
         info!("→ Pushing JS file to device...");
         let output = tokio::process::Command::new(which::which("adb")?)
             .arg("push")
             .arg(entry)
-            .arg(&target_config.push_path.as_ref().unwrap())
+            .arg(push_path)
             .output()
             .await?;
 
@@ -339,10 +358,13 @@ fn update_watcher_targets(
         )?;
     }
 
-    watcher.watch(
-        target_config.entry.clone().unwrap(),
-        notify_debouncer_full::notify::RecursiveMode::NonRecursive,
-    )?;
+    // Not every target has an entry file (watch-only targets do not).
+    if let Some(entry) = &target_config.entry {
+        watcher.watch(
+            entry,
+            notify_debouncer_full::notify::RecursiveMode::NonRecursive,
+        )?;
+    }
 
     Ok(())
 }
@@ -383,7 +405,15 @@ async fn watch_target(target: String) -> Result<()> {
                         }
                     }
 
-                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    // A panic here would take down the watcher thread; report and
+                    // keep watching instead.
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            warn!("Failed to start a runtime for the rebuild: {e}");
+                            return;
+                        }
+                    };
                     rt.block_on(async {
                         let target_config = if config_updated {
                             match load_config(&config_path, true) {
@@ -393,15 +423,29 @@ async fn watch_target(target: String) -> Result<()> {
                                         .targets[&target]
                                         .clone();
 
-                                    if new_config.entry != target_config.lock().unwrap().entry || new_config.watch_path != target_config.lock().unwrap().watch_path {
-                                        panic!("Target entry or watchPath changed, please restart the watcher.");
+                                    // `entry` and `watchPath` decide what is
+                                    // watched, so changing them needs a restart.
+                                    let changed = {
+                                        let guard = target_config.lock().unwrap_or_else(|e| e.into_inner());
+                                        new_config.entry != guard.entry
+                                            || new_config.watch_path != guard.watch_path
+                                    };
+                                    if changed {
+                                        warn!(
+                                            "Target entry or watchPath changed; restart the watcher for it to take effect."
+                                        );
+                                        return;
                                     }
 
-                                    target_config.lock().unwrap().clone_from(&new_config);
+                                    target_config
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone_from(&new_config);
                                     target_config.clone()
                                 }
                                 Err(e) => {
-                                    panic!("Failed to reload configuration: {}", e);
+                                    warn!("Failed to reload configuration: {e}");
+                                    return;
                                 }
                             }
                         } else {
@@ -410,7 +454,9 @@ async fn watch_target(target: String) -> Result<()> {
 
                         if let Err(e) = update_target(
                             &target,
-                            &target_config.lock().unwrap(),
+                            &target_config
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()),
                             config_updated,
                         )
                         .await

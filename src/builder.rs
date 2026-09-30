@@ -246,9 +246,11 @@ impl Builder {
         let config_data = serde_json::to_string(&config_data)?;
 
         // Add embedded config section
+        // Propagate the error: unwrapping here silently shipped an unpatched
+        // payload whenever the patcher rejected the binary.
         processor
             .add_embedded_config_data(config_data.as_bytes(), use_xz)
-            .unwrap();
+            .context("Failed to patch the payload with the embedded script")?;
 
         processor.anti_anti_frida()?;
 
@@ -510,7 +512,11 @@ doNotCompress:
         info!("→ Building APK with apktool b...");
         let output = tokio::process::Command::new(which::which("apktool")?)
             .arg("b")
-            .arg(temp_path.to_str().unwrap())
+            .arg(
+                temp_path
+                    .to_str()
+                    .context("Temporary path is not valid UTF-8")?,
+            )
             .arg("-o")
             .arg(temp_path.join("dist").join("app-debug.apk"))
             .output()
@@ -532,7 +538,9 @@ doNotCompress:
                 .join("dist")
                 .join(format!("{base_name}-{platform}-signed.apk"));
 
-            let sign_config = target.sign.as_ref().unwrap();
+            let sign_config = target.sign.as_ref().context(
+                "This target needs a `sign` section (keystore, keystorePass, keystoreAlias) to produce a signed artifact",
+            )?;
             let keystore = &sign_config.keystore;
             let keystore_pass = &sign_config.keystore_pass;
             let keystore_alias = &sign_config.keystore_alias;
@@ -627,7 +635,10 @@ doNotCompress:
             info!("→ Using source APK path: {apk_path}");
             PathBuf::from(apk_path)
         } else {
-            let package_name = inject_config.source_apk_package_name.as_ref().unwrap();
+            let package_name = inject_config
+                .source_apk_package_name
+                .as_ref()
+                .context("injectApk needs either `sourceApkPath` or `sourceApkPackageName`")?;
             info!("→ Extracting APK from device for package: {package_name}");
             self.extract_apk_from_device(package_name).await?
         };
@@ -690,7 +701,7 @@ doNotCompress:
         fs::write(
             Path::new(&target_lib_path)
                 .parent()
-                .unwrap()
+                .unwrap_or_else(|| Path::new("."))
                 .join(&inject_lib_name),
             &injected_binary_data,
         )
