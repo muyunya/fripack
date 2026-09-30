@@ -8,7 +8,7 @@ use object::{
         coff::CoffHeader,
         pe::{ImageNtHeaders, ImageOptionalHeader},
     },
-    LittleEndian as LE, Object, ObjectSymbol,
+    LittleEndian as LE, Object, ObjectSection, ObjectSegment, ObjectSymbol,
 };
 use rand::Rng;
 #[repr(C, packed)]
@@ -64,7 +64,12 @@ impl EmbeddedConfig {
 pub enum ObjectFormat {
     Elf,
     Pe,
+    MachO,
 }
+
+/// Name of the reserved section a Mach-O payload must expose so that fripack can
+/// inject the script without rewriting the Mach-O structure.
+pub const PAYLOAD_SECTION: &str = "__fripack";
 
 pub struct BinaryProcessor {
     data: Vec<u8>,
@@ -73,10 +78,22 @@ pub struct BinaryProcessor {
 
 impl BinaryProcessor {
     pub fn new(data: Vec<u8>) -> Result<Self> {
+        // `File::parse` rejects universal binaries with a generic
+        // "Unsupported file format", so give a useful message instead.
+        if let Ok(object::FileKind::MachOFat32 | object::FileKind::MachOFat64) =
+            object::FileKind::parse(data.as_slice())
+        {
+            anyhow::bail!(
+                "Universal (fat) Mach-O binaries are not supported; build the payload for a single \
+                 architecture"
+            );
+        }
+
         let format = match object::read::File::parse(data.as_slice())? {
             object::read::File::Elf32(_) | object::read::File::Elf64(_) => ObjectFormat::Elf,
             object::read::File::Pe32(_) | object::read::File::Pe64(_) => ObjectFormat::Pe,
-            _ => anyhow::bail!("Invalid ELF/PE binary"),
+            object::read::File::MachO32(_) | object::read::File::MachO64(_) => ObjectFormat::MachO,
+            _ => anyhow::bail!("Unsupported binary format (expected ELF, PE or Mach-O)"),
         };
 
         Ok(Self { data, format })
@@ -246,7 +263,114 @@ impl BinaryProcessor {
                 };
                 self.data = out_data;
             }
+            ObjectFormat::MachO => {
+                self.patch_macho(&data, &mut embedded_config)?;
+            }
         }
+
+        Ok(())
+    }
+
+    /// Patch a Mach-O payload using **pure byte writes** — the Mach-O structure
+    /// is never rewritten.
+    ///
+    /// The payload is expected to ship a reserved, file-backed section
+    /// ([`PAYLOAD_SECTION`]) that lives in the same segment as
+    /// `g_embedded_config`. Because both then share one segment, the difference
+    /// between their file offsets equals the difference between their virtual
+    /// addresses, which is exactly what `data_offset` has to encode.
+    ///
+    /// Note for callers: patching invalidates the code signature. The artifact
+    /// must be re-signed (`codesign --force --sign -`) before it can be loaded,
+    /// otherwise dyld refuses to map it.
+    fn patch_macho(&mut self, payload: &[u8], config: &mut EmbeddedConfig) -> Result<()> {
+        // ---- read-only pass: locate the config and the reserved section ----
+        let (config_offset, section_offset, section_size, data_offset) = {
+            let config_offset = self.find_embedded_config().context(
+                "Failed to find the embedded config struct: magic mismatch, or this payload has \
+                 already been patched",
+            )?;
+
+            let file = object::read::File::parse(self.data.as_slice())?;
+
+            let section = file
+                .sections()
+                .find(|section| section.name() == Ok(PAYLOAD_SECTION))
+                .with_context(|| {
+                    format!(
+                        "Reserved payload section '{PAYLOAD_SECTION}' not found. Mach-O payloads \
+                         must be built with one, e.g.\n  \
+                         extern \"C\" __attribute__((used, section(\"__DATA,{PAYLOAD_SECTION}\"))) \
+                         char g_fripack_payload[N] = {{0}};"
+                    )
+                })?;
+
+            let (section_offset, section_size) = section.file_range().with_context(|| {
+                format!(
+                    "Reserved payload section '{PAYLOAD_SECTION}' occupies no file space (the \
+                     linker folded it into zerofill). Give it an explicit initialiser, e.g. \
+                     `= {{0}}`."
+                )
+            })?;
+
+            // Segment that maps the config, resolved by file offset.
+            let (segment_addr, segment_offset, segment_size) = file
+                .segments()
+                .find_map(|segment| {
+                    let (offset, size) = segment.file_range();
+                    let maps_config = size > 0
+                        && offset <= config_offset as u64
+                        && (config_offset as u64) < offset + size;
+                    maps_config.then(|| (segment.address(), offset, size))
+                })
+                .context("Failed to find the Mach-O segment that maps the embedded config")?;
+
+            if section_offset < segment_offset || section_offset >= segment_offset + segment_size {
+                anyhow::bail!(
+                    "Reserved payload section '{PAYLOAD_SECTION}' is not inside the same segment \
+                     as the embedded config, so `data_offset` would not be a valid virtual-address \
+                     delta. Place it in __DATA."
+                );
+            }
+
+            let config_vaddr = config_offset as u64 - segment_offset + segment_addr;
+            let data_offset = section.address() as i64 - config_vaddr as i64;
+            if data_offset < i32::MIN as i64 || data_offset > i32::MAX as i64 {
+                anyhow::bail!("Computed data_offset {data_offset} does not fit into an i32");
+            }
+
+            (config_offset, section_offset, section_size, data_offset)
+        };
+
+        if payload.len() as u64 > section_size {
+            anyhow::bail!(
+                "Payload is {} bytes but the reserved section only holds {} bytes; increase the \
+                 reserved size in the payload",
+                payload.len(),
+                section_size
+            );
+        }
+
+        // ---- write pass ----
+        config.data_size = payload.len() as i32;
+        config.data_offset = data_offset as i32;
+        let config_bytes = config.as_bytes();
+
+        self.data
+            .get_mut(config_offset..config_offset + config_bytes.len())
+            .context("Embedded config lies outside the file")?
+            .copy_from_slice(&config_bytes);
+
+        let section_start = section_offset as usize;
+        self.data
+            .get_mut(section_start..section_start + payload.len())
+            .context("Reserved payload section lies outside the file")?
+            .copy_from_slice(payload);
+
+        info!(
+            "Patched Mach-O: data_offset={data_offset:#x} (config@{config_offset:#x}, \
+             section@{section_offset:#x}, reserved {section_size:#x} bytes)"
+        );
 
         Ok(())
     }
@@ -564,5 +688,157 @@ impl BinaryProcessor {
 
     pub fn into_data(self) -> Vec<u8> {
         self.data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small Mach-O dylib exposing the same ABI as a real payload.
+    /// Regenerate with `tests/fixtures/build_fixture.sh`.
+    const MACHO_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/payload-macos-arm64.dylib");
+
+    fn payload_bytes() -> &'static [u8] {
+        br#"{"mode":1,"js_filepath":"main.js","js_content":"console.log(1)","watch_path":null}"#
+    }
+
+    fn read_i32(data: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn macho_fixture_is_recognised() {
+        let processor = BinaryProcessor::new(MACHO_FIXTURE.to_vec()).unwrap();
+        assert!(matches!(processor.format, ObjectFormat::MachO));
+        assert!(processor.find_embedded_config().is_some());
+    }
+
+    /// The reserved section must be file-backed, otherwise the whole approach
+    /// cannot work (this is the failure mode a payload without an explicit
+    /// initialiser runs into).
+    #[test]
+    fn macho_fixture_reserved_section_is_file_backed() {
+        let file = object::read::File::parse(MACHO_FIXTURE).unwrap();
+        let section = file
+            .sections()
+            .find(|section| section.name() == Ok(PAYLOAD_SECTION))
+            .expect("fixture must expose the reserved section");
+        let (_, size) = section
+            .file_range()
+            .expect("reserved section must occupy file space");
+        assert_eq!(size, 4096);
+    }
+
+    #[test]
+    fn macho_patch_writes_config_and_payload() {
+        let mut processor = BinaryProcessor::new(MACHO_FIXTURE.to_vec()).unwrap();
+        let config_offset = processor.find_embedded_config().unwrap();
+
+        let payload = payload_bytes();
+        processor.add_embedded_config_data(payload, false).unwrap();
+        let patched = processor.into_data();
+
+        assert_eq!(
+            read_i32(&patched, config_offset + 12) as usize,
+            payload.len()
+        );
+        assert_eq!(patched[config_offset + 20], 0, "data_xz must stay false");
+
+        // `data_offset` is a virtual-address delta, so it must land exactly on
+        // the reserved section's contents.
+        let data_offset = read_i32(&patched, config_offset + 16);
+        let start = (config_offset as i64 + data_offset as i64) as usize;
+        assert_eq!(&patched[start..start + payload.len()], payload);
+
+        // ... and that address must be the section's virtual address.
+        let file = object::read::File::parse(patched.as_slice()).unwrap();
+        let section = file
+            .sections()
+            .find(|section| section.name() == Ok(PAYLOAD_SECTION))
+            .unwrap();
+        let segment = file
+            .segments()
+            .find(|segment| {
+                let (offset, size) = segment.file_range();
+                size > 0 && offset <= config_offset as u64 && (config_offset as u64) < offset + size
+            })
+            .unwrap();
+        let (segment_offset, _) = segment.file_range();
+        let config_vaddr = config_offset as u64 - segment_offset + segment.address();
+        assert_eq!(
+            start as u64,
+            section.address() - config_vaddr + config_offset as u64
+        );
+        assert_eq!(
+            section.address() as i64 - config_vaddr as i64,
+            data_offset as i64
+        );
+    }
+
+    #[test]
+    fn macho_missing_reserved_section_is_reported() {
+        // Scramble the section name in the section header.
+        let mut data = MACHO_FIXTURE.to_vec();
+        let position = data
+            .windows(PAYLOAD_SECTION.len())
+            .position(|window| window == PAYLOAD_SECTION.as_bytes())
+            .expect("fixture must contain the section name");
+        data[position..position + PAYLOAD_SECTION.len()].copy_from_slice(b"__fripacX");
+
+        let mut processor = BinaryProcessor::new(data).unwrap();
+        let error = processor
+            .add_embedded_config_data(payload_bytes(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not found"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn macho_missing_config_magic_is_reported() {
+        let mut data = MACHO_FIXTURE.to_vec();
+        let position = data
+            .windows(4)
+            .position(|window| window == 0x0d000721i32.to_le_bytes())
+            .expect("fixture must contain the config magic");
+        data[position] ^= 0xff;
+
+        let mut processor = BinaryProcessor::new(data).unwrap();
+        let error = processor
+            .add_embedded_config_data(payload_bytes(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("embedded config"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn macho_oversized_payload_is_rejected() {
+        let mut processor = BinaryProcessor::new(MACHO_FIXTURE.to_vec()).unwrap();
+        let error = processor
+            .add_embedded_config_data(&vec![0u8; 4097], false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only holds"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn non_object_data_is_rejected() {
+        assert!(BinaryProcessor::new(b"not a binary at all".to_vec()).is_err());
+    }
+
+    #[test]
+    fn universal_macho_is_reported_clearly() {
+        // Minimal fat header: magic + one architecture entry.
+        let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x01];
+        fat.extend_from_slice(&[0u8; 20]);
+
+        let error = match BinaryProcessor::new(fat) {
+            Ok(_) => panic!("universal Mach-O should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Universal"), "unexpected error: {error}");
     }
 }

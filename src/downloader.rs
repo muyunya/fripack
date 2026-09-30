@@ -77,7 +77,12 @@ impl Downloader {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "so") {
+            // Every platform's prebuilt payload extension, not just Android's.
+            let is_prebuilt = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "so" | "dll" | "dylib"));
+            if path.is_file() && is_prebuilt {
                 files.push(path);
             }
         }
@@ -173,7 +178,7 @@ impl Downloader {
             info!("→ Using cached zygisk loader: {}", cached_path.display());
             return Ok(fs::read(&cached_path).await?);
         }
-        
+
         let latest_release = self
             .client
             .get("https://api.github.com/repos/FriRebuild/fripack-zygisk-loader/releases/latest")

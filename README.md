@@ -81,10 +81,10 @@ The following options are available for all target types:
 
 - `xz` (default: `false`): Compress the script using LZMA.
 - `entry` (required): Entry point script to bundle.
-- `fridaVersion` (required): Frida version to use (must be 17.5.1 or newer).
+- `fridaVersion` (required): Frida version to use (must be 17.5.1 or newer). Only needed when fripack has to download the prebuilt payload, i.e. when `overridePrebuildFile` is not set.
 - `outputDir` (default: `./fripack`): Output directory for built artifacts.
 - `platform`: Target platform (e.g., `android-arm64`, `windows-x86_64`).
-  - Valid values: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`
+  - Valid values: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`, `macos-arm64`, `macos-x86_64`
 - `version`: Version of your plugin.
 - `type`: Type of the target (defines the output format).
 - `inherit`: Key of another target to inherit configuration from.
@@ -153,7 +153,7 @@ Builds your Frida script into an Xposed Module. Only supports `Android` platform
   - `keyPass` (optional): The password for the signer's private key.
 #### `shared`
 
-Builds your Frida script into a shared library (`.so` / `.dll`) that can be loaded via various methods (e.g., `LD_PRELOAD`).
+Builds your Frida script into a shared library (`.so` / `.dll` / `.dylib`) that can be loaded via various methods (e.g., `LD_PRELOAD`).
 
 #### `inject-apk`
 
@@ -267,6 +267,29 @@ Under watch mode, the injected payload monitors a specified path and triggers a 
 ---
 
 ## Notes
+### macOS
+
+`macos-arm64` and `macos-x86_64` produce a `.dylib`. Two things are worth knowing:
+
+- **The artifact is re-signed automatically.** Patching the payload invalidates its code signature, and macOS refuses to load a Mach-O with a broken signature, so fripack runs `codesign --force --sign -` (ad-hoc) on the output. Building a macOS target therefore requires macOS and the Xcode Command Line Tools.
+- **Loading the result into another application is restricted by that application.** For a normally built, hardened-runtime app, `DYLD_INSERT_LIBRARIES` is ignored by dyld, and patching executable code is blocked. Getting a macOS payload into a *signed* application means modifying and re-signing that application, which is out of scope for this tool today.
+
+While no macOS payload is published yet, build one locally and point the target at it:
+
+```json
+{
+  "macos": {
+    "type": "shared",
+    "platform": "macos-arm64",
+    "entry": "./main.js",
+    "overridePrebuildFile": "./libfripack-inject.dylib",
+    "outputDir": "./fripack"
+  }
+}
+```
+
+See `tests/e2e/macos_e2e.sh` for a complete, runnable example (it builds a throwaway payload, patches it, injects it and checks the result).
+
 ### How to check the logs?
 On Android, logs are output through the Android logging system with the tag `FriPackInject`. You can view them using adb:
 ```bash

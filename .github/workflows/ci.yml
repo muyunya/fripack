@@ -9,6 +9,30 @@ on:
     types: [ published ]
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Unit tests
+      # Includes the Mach-O patching tests, which operate on a committed fixture
+      # and therefore run on every platform.
+      run: cargo test
+
+  macos-e2e:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build
+      run: cargo build
+    - name: End-to-end macOS target test
+      # Patches a Mach-O payload, checks it is re-signed, injects it into a host
+      # process and verifies the embedded script is recovered.
+      run: ./tests/e2e/macos_e2e.sh
+
   build:
     runs-on: ${{ matrix.os }}
     strategy:

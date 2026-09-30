@@ -278,7 +278,7 @@ impl FripackConfig {
         }
 
         // Override with current target values
-        resolved.merge_from(target);
+        resolved.merge_from(target)?;
 
         processing.remove(name);
         resolved_targets.insert(name.to_string(), resolved);
@@ -441,7 +441,7 @@ pub struct ResolvedTarget {
 }
 
 impl ResolvedTarget {
-    pub fn merge_from(&mut self, other: &TargetConfig) {
+    pub fn merge_from(&mut self, other: &TargetConfig) -> Result<()> {
         merge_fields!(
             self,
             other,
@@ -464,7 +464,10 @@ impl ResolvedTarget {
         );
 
         if let Some(platform_str) = &other.platform {
-            self.platform = Some(PlatformConfig::from_str(platform_str.clone()).unwrap());
+            // Report a bad platform string instead of panicking on it.
+            self.platform = Some(PlatformConfig::from_str(platform_str.clone())?);
         }
+
+        Ok(())
     }
 }

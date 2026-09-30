@@ -77,10 +77,10 @@ fripack watch xposed
 
 - `xz` (默认: `false`): 使用 LZMA 压缩脚本。
 - `entry` (必需): 要打包的入口脚本文件。
-- `fridaVersion` (必需): 使用的 Frida 版本（必须为 17.5.1 或更新）。
+- `fridaVersion` (必需): 使用的 Frida 版本（必须为 17.5.1 或更新）。仅在需要下载预编译载荷时必需，即未设置 `overridePrebuildFile` 时。
 - `outputDir` (默认: `./fripack`): 构建产物输出的目录。
 - `platform`: 目标平台 (例如 `android-arm64`, `windows-x86_64`)。
-  - 有效值: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`
+  - 有效值: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`, `macos-arm64`, `macos-x86_64`
 - `version`: 你的插件版本。
 - `type`: 目标类型（定义了输出格式）。
 - `inherit`: 要继承配置的另一个目标的键名。
@@ -150,7 +150,7 @@ fripack watch xposed
 
 #### `shared`
 
-将你的 Frida 脚本构建成一个共享库 (`.so` / `.dll`)，可以通过多种方式加载（例如 `LD_PRELOAD`）。
+将你的 Frida 脚本构建成一个共享库 (`.so` / `.dll` / `.dylib`)，可以通过多种方式加载（例如 `LD_PRELOAD`）。
 
 #### `inject-apk`
 
@@ -263,6 +263,29 @@ fripack watch my-watch-target
 ---
 
 ## Notes
+### macOS
+
+`macos-arm64` 与 `macos-x86_64` 会产出 `.dylib`。有两点需要了解：
+
+- **产物会被自动重新签名。** 改写载荷会使它的代码签名失效，而 macOS 拒绝加载签名损坏的 Mach-O，因此 fripack 会对产物执行 `codesign --force --sign -`（ad-hoc 签名）。也正因如此，构建 macOS 目标必须在 macOS 上进行，并安装 Xcode Command Line Tools。
+- **能否加载进其它程序取决于那个程序本身。** 对于正常构建、启用了加固运行时（hardened runtime）的程序，dyld 会忽略 `DYLD_INSERT_LIBRARIES`，改写可执行代码也会被阻止。要把 macOS 载荷注入到**已签名**的程序里，需要修改并重新签名那个程序，这超出了本工具当前的范围。
+
+在 macOS 载荷正式发布之前，可以自行构建一个并用 `overridePrebuildFile` 指过去：
+
+```json
+{
+  "macos": {
+    "type": "shared",
+    "platform": "macos-arm64",
+    "entry": "./main.js",
+    "overridePrebuildFile": "./libfripack-inject.dylib",
+    "outputDir": "./fripack"
+  }
+}
+```
+
+完整可运行的示例见 `tests/e2e/macos_e2e.sh`（它会现场构建一个临时载荷、改写、注入并校验结果）。
+
 ### 如何查看日志？
 在 Android 上，日志通过 Android 日志系统输出，标签为 `FriPackInject`。你可以使用 adb 查看它们：
 ```bash

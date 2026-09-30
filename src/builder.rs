@@ -65,6 +65,46 @@ fn find_sdk_binary(bin_name: &str) -> Result<PathBuf> {
         .with_context(|| format!("Binary '{}' not found in Android SDK build-tools", bin_name))
 }
 
+/// Re-signs a Mach-O artifact with an ad-hoc signature.
+///
+/// fripack patches payload bytes in place, which invalidates whatever signature
+/// the payload shipped with. macOS then refuses to load it (the process is
+/// killed outright on Apple Silicon), so every macOS artifact has to be signed
+/// again. `--sign -` produces an ad-hoc signature, which is enough for a dylib
+/// loaded into a process that does not enforce library validation.
+async fn sign_macos_binary(path: &Path) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "Building a macOS target requires macOS, because the patched payload must be re-signed \
+             with codesign; current host is {}",
+            std::env::consts::OS
+        );
+    }
+
+    info!("→ Re-signing patched Mach-O payload (ad-hoc)...");
+    let output = Command::new("codesign")
+        .arg("--force")
+        .arg("--sign")
+        .arg("-")
+        .arg(path)
+        .output()
+        .await
+        .context(
+            "Failed to run `codesign`; install the Xcode Command Line Tools with `xcode-select \
+             --install`",
+        )?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to re-sign {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
 impl Builder {
     pub fn new() -> Self {
         Self {
@@ -128,10 +168,6 @@ impl Builder {
             .platform
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing required field: platform"))?;
-        let frida_version = target
-            .frida_version
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Missing required field: fridaVersion"))?;
         let mode = if target.watch_mode {
             "watchpath"
         } else {
@@ -153,6 +189,13 @@ impl Builder {
 
             fs::read(override_file).await?
         } else {
+            // Only needed when we actually have to download a payload, so a
+            // target that overrides the prebuilt file does not have to declare it.
+            let frida_version = target.frida_version.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing required field: fridaVersion (used to pick the prebuilt payload)"
+                )
+            })?;
             info!("→ Downloading prebuilt file for platform: {platform:?}");
             self.downloader
                 .download_prebuilt_file(platform, frida_version)
@@ -224,6 +267,13 @@ impl Builder {
         let output_file_path = std::path::Path::new(output_dir).join(&output_filename);
         std::fs::create_dir_all(output_dir)?;
         fs::write(&output_file_path, output_data).await?;
+
+        // Patching a Mach-O payload invalidates its code signature, and dyld
+        // refuses to load a dylib with a broken signature (on Apple Silicon the
+        // process is killed outright), so re-sign it before handing it over.
+        if platform.platform == Platform::MacOS {
+            sign_macos_binary(&output_file_path).await?;
+        }
 
         info!(
             "✓ Successfully built shared library: {}",
