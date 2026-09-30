@@ -71,6 +71,13 @@ pub enum ObjectFormat {
 /// inject the script without rewriting the Mach-O structure.
 pub const PAYLOAD_SECTION: &str = "__fripack";
 
+/// Symbol an ELF payload has to reserve for the embedded script.
+///
+/// Located through .dynsym rather than by section name: a section called `.data.*`
+/// is merged into `.data` by the default linker script and loses its name, while an
+/// exported symbol survives both linking and stripping.
+pub const ELF_PAYLOAD_SYMBOL: &str = "g_fripack_payload";
+
 pub struct BinaryProcessor {
     data: Vec<u8>,
     format: ObjectFormat,
@@ -96,6 +103,15 @@ impl ElfSegment {
     fn vaddr_of_offset(&self, offset: u64) -> Option<u64> {
         (self.offset <= offset && offset < self.offset + self.filesz)
             .then(|| self.vaddr + (offset - self.offset))
+    }
+
+    /// File offset for a virtual address inside this segment's file contents.
+    ///
+    /// Only the file-backed part counts: an address in the zero-filled tail has no
+    /// bytes in the file to write to.
+    fn offset_of_vaddr(&self, vaddr: u64) -> Option<u64> {
+        (self.vaddr <= vaddr && vaddr < self.vaddr + self.filesz)
+            .then(|| self.offset + (vaddr - self.vaddr))
     }
 }
 
@@ -228,6 +244,64 @@ fn elf_sections(data: &[u8]) -> Result<Vec<ElfSection>> {
         });
     }
     Ok(sections)
+}
+
+/// Address and size of a defined symbol in .dynsym.
+fn elf_symbol(data: &[u8], wanted: &str) -> Result<Option<(u64, u64)>> {
+    const SHN_UNDEF: u16 = 0;
+
+    let is_64 = elf_is_64(data)?;
+    let sections = elf_sections(data)?;
+    let Some(dynsym) = sections.iter().find(|section| section.name == ".dynsym") else {
+        return Ok(None);
+    };
+    let dynstr = sections
+        .get(dynsym.link as usize)
+        .context("Failed to find the string table linked from .dynsym")?;
+
+    let entsize = match dynsym.entsize as usize {
+        0 if is_64 => 24,
+        0 => 16,
+        other => other,
+    };
+    let table = dynsym.offset as usize;
+    let strings = dynstr.offset as usize;
+    let strings_end = strings + dynstr.size as usize;
+
+    for index in 0..(dynsym.size as usize / entsize) {
+        let base = table + index * entsize;
+        let (name, shndx, value, size) = if is_64 {
+            (
+                read_u32(data, base)?,
+                read_u16(data, base + 6)?,
+                read_u64(data, base + 8)?,
+                read_u64(data, base + 16)?,
+            )
+        } else {
+            (
+                read_u32(data, base)?,
+                read_u16(data, base + 14)?,
+                read_u32(data, base + 4)? as u64,
+                read_u32(data, base + 8)? as u64,
+            )
+        };
+        if name == 0 || shndx == SHN_UNDEF {
+            continue;
+        }
+        let start = strings + name as usize;
+        if start >= strings_end || start >= data.len() {
+            continue;
+        }
+        let end = data[start..strings_end.min(data.len())]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| start + n)
+            .unwrap_or(strings_end);
+        if &data[start..end] == wanted.as_bytes() {
+            return Ok(Some((value, size)));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads the PT_LOAD entries of a 32- or 64-bit little-endian ELF.
@@ -490,21 +564,29 @@ impl BinaryProcessor {
 
     /// Writes the embedded config into an ELF payload using byte writes only.
     ///
-    /// The program header table and the section header table are left exactly as
-    /// they were; an existing PT_LOAD simply has its p_filesz grown to cover the
-    /// appended data.
+    /// The payload reserves a section for the script; this fills it in and points
+    /// the config at it. Nothing about the layout changes - no program header is
+    /// added, no section is added, no size is grown - which is the whole point.
     ///
-    /// The previous implementation asked the ELF builder to append a section and a
-    /// PT_LOAD for the payload. Adding a program header makes the program header
-    /// table one entry longer, and in fripack-inject's Linux payload that table
-    /// ends exactly where .dynsym begins - both at 0x238, with no gap - so the new
-    /// entry landed on top of the first two dynamic symbols. The code noticed the
-    /// overlap and "moved" the section, but it only rewrote the section header's
-    /// sh_offset: the bytes were never copied and DT_SYMTAB still pointed at the
-    /// old address, which is where the program header table now lived. The loader
-    /// duly relocated against a corrupted symbol - measured dynsym[1].st_value ==
-    /// 0x78 - and jumped to base + 0x78, segfaulting before the payload's
-    /// constructor ever ran.
+    /// Three earlier attempts rewrote the file instead, and each broke the payload
+    /// in a different way:
+    ///
+    ///   * appending a section plus a PT_LOAD made the program header table one
+    ///     entry longer. In fripack-inject's Linux payload that table ends exactly
+    ///     where .dynsym begins, both at 0x238 with no gap, so the new entry landed
+    ///     on the first two dynamic symbols while DT_SYMTAB still pointed there.
+    ///     The loader relocated against a corrupted symbol - dynsym[1].st_value
+    ///     became 0x78 - and jumped to base + 0x78. Segfault before init.
+    ///   * growing an existing segment's p_filesz instead puts the appended bytes
+    ///     into the part of the segment that is .bss, so globals that are meant to
+    ///     be zero-filled come up holding file bytes. Measured: doing that and
+    ///     nothing else, with no config written at all, is enough to stop the
+    ///     payload's constructor from running.
+    ///   * rewriting the file through the ELF builder re-laid it out, and the result
+    ///     segfaulted the loader.
+    ///
+    /// Reserving the space up front avoids all of it, which is the same conclusion
+    /// the Mach-O path reached with __fripack.
     fn patch_elf(
         &mut self,
         data: &[u8],
@@ -513,58 +595,60 @@ impl BinaryProcessor {
     ) -> Result<()> {
         let segments = elf_load_segments(self.data.as_slice())?;
 
+        let (reserved_vaddr, reserved_size) = elf_symbol(self.data.as_slice(), ELF_PAYLOAD_SYMBOL)?
+            .with_context(|| {
+                format!(
+                    "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' not found in .dynsym. ELF \
+                     payloads must reserve file-backed space for the embedded script, e.g.\n  \
+                     __attribute__((used, visibility(\"default\")))\n  \
+                     unsigned char g_fripack_payload[1048576] = {{1}};\n\
+                     The initialiser matters: an all-zero array is folded into .bss, which takes no \
+                     space in the file and so cannot carry the script."
+                )
+            })?;
+
+        if reserved_size < data.len() as u64 {
+            anyhow::bail!(
+                "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' is {reserved_size} bytes but the \
+                 embedded script needs {}; raise the payload's reservation",
+                data.len()
+            );
+        }
+
+        // It also has to be file-backed and mapped, or there is nowhere to write the
+        // script and nothing for the payload to read.
+        let reserved_offset = segments
+            .iter()
+            .find_map(|segment| segment.offset_of_vaddr(reserved_vaddr))
+            .with_context(|| {
+                format!(
+                    "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' at {reserved_vaddr:#x} is not in \
+                     the file-backed part of any PT_LOAD segment (is it in .bss?)"
+                )
+            })?;
+
         let config_offset = self
             .find_embedded_config()
             .context("Embedded config not found in the ELF payload")?;
         let config_vaddr = segments
             .iter()
-            .find_map(|seg| seg.vaddr_of_offset(config_offset as u64))
+            .find_map(|segment| segment.vaddr_of_offset(config_offset as u64))
             .context("Embedded config is not covered by any PT_LOAD segment")?;
 
-        // Park the data in the tail of a writable segment that has memory beyond
-        // its file contents (a .bss), past the end of the file so that appending
-        // cannot overwrite anything.
-        let file_len = self.data.len() as u64;
-        let mut chosen: Option<(ElfSegment, u64, u64)> = None;
-        for seg in segments.iter() {
-            if seg.p_type != PT_LOAD || seg.flags & PF_W == 0 {
-                continue;
-            }
-            let after_eof = file_len.saturating_sub(seg.offset);
-            let delta = round_up(seg.filesz.max(after_eof), PAGE_SIZE);
-            let new_filesz = delta + data.len() as u64;
-            if new_filesz > seg.memsz {
-                continue; // would not fit in the segment's memory
-            }
-            // Prefer the tightest fit so the appended data stays close to its segment.
-            if chosen
-                .as_ref()
-                .is_none_or(|(_, _, best_filesz)| new_filesz < *best_filesz)
-            {
-                chosen = Some((seg.clone(), delta, new_filesz));
-            }
-        }
-        let (segment, delta, new_filesz) = chosen.context(
-            "No writable PT_LOAD segment has room for the embedded script; the payload \
-             needs a segment whose memory size exceeds its file size (a .bss)",
-        )?;
-
-        let data_vaddr = segment.vaddr + delta;
-        let write_at = (segment.offset + delta) as usize;
-        if self.data.len() < write_at {
-            self.data.resize(write_at, 0);
-        }
-        self.data.extend_from_slice(data);
-
-        write_elf_word(
-            &mut self.data,
-            segment.filesz_field,
-            new_filesz,
-            segment.is_64,
-        )?;
+        let start = reserved_offset as usize;
+        self.data[start..start + data.len()].copy_from_slice(data);
 
         embedded_config.data_size = data.len() as i32;
-        embedded_config.data_offset = (data_vaddr - config_vaddr) as i32;
+        // Signed on purpose: the payload adds this to &g_embedded_config, so the
+        // reserved buffer may sit either side of the config - on the ELF fixture it
+        // is 64 KB *below* it, and an unsigned subtraction would wrap.
+        let delta = reserved_vaddr as i64 - config_vaddr as i64;
+        embedded_config.data_offset = i32::try_from(delta).with_context(|| {
+            format!(
+                "Reserved payload symbol '{ELF_PAYLOAD_SYMBOL}' is {delta} bytes away from the \
+                 embedded config, which does not fit the 32-bit offset the config stores"
+            )
+        })?;
         embedded_config.data_xz = use_xz;
 
         let config_bytes = embedded_config.as_bytes();
@@ -574,11 +658,11 @@ impl BinaryProcessor {
         let data_offset = embedded_config.data_offset;
         info!(
             "Patched ELF: data_offset={data_offset:#x} (config@{config_offset:#x} \
-             vaddr={config_vaddr:#x}, data@{data_vaddr:#x}, p_filesz {:#x} -> {new_filesz:#x})",
-            segment.filesz
+             vaddr={config_vaddr:#x}, reserved@{reserved_vaddr:#x}, {reserved_size} bytes available)"
         );
         Ok(())
     }
+
 
     pub fn anti_anti_frida(&mut self) -> Result<()> {
         if let ObjectFormat::Elf = self.format {
@@ -926,6 +1010,97 @@ mod tests {
 
     fn read_i32(data: &[u8], offset: usize) -> i32 {
         i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// ELF payload exposing the same ABI: a config the patcher finds by magic and
+    /// a reserved buffer it finds by symbol. Regenerate with
+    /// `tests/fixtures/build_elf_fixture.sh` on Linux.
+    const ELF_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/payload-linux-x86_64.so");
+
+    #[test]
+    fn elf_fixture_is_recognised() {
+        let processor = BinaryProcessor::new(ELF_FIXTURE.to_vec()).unwrap();
+        assert!(matches!(processor.format, ObjectFormat::Elf));
+        assert!(processor.find_embedded_config().is_some());
+    }
+
+    /// The reserved buffer must be file-backed, or there is nowhere to put the
+    /// script: an all-zero array is folded into .bss, which takes no space in the
+    /// file. This is the trap a payload author falls into.
+    #[test]
+    fn elf_fixture_reserved_buffer_is_file_backed() {
+        let (vaddr, size) = elf_symbol(ELF_FIXTURE, ELF_PAYLOAD_SYMBOL)
+            .unwrap()
+            .expect("fixture must export the reserved buffer");
+        assert_eq!(size, 65536);
+        let segments = elf_load_segments(ELF_FIXTURE).unwrap();
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.offset_of_vaddr(vaddr).is_some()),
+            "reserved buffer at {vaddr:#x} has no file-backed home"
+        );
+    }
+
+    /// Patching writes bytes and nothing else. The failure this guards against is
+    /// structural: appending a program header, or growing a segment's file size,
+    /// both corrupt a real payload, and both show up as a different file size or
+    /// as changes outside the two regions below.
+    #[test]
+    fn elf_patching_touches_only_the_config_and_the_reserved_buffer() {
+        let mut processor = BinaryProcessor::new(ELF_FIXTURE.to_vec()).unwrap();
+        let mut config = EmbeddedConfig::new(0, 0, false);
+        let payload = b"{\"mode\":\"EmbedJs\",\"js_content\":\"1\"}";
+
+        // Locate the config first: find_embedded_config only matches an unpatched
+        // one, i.e. while data_size and data_offset are still zero.
+        let config_offset = processor.find_embedded_config().unwrap();
+
+        processor.patch_elf(payload, &mut config, false).unwrap();
+
+        assert_eq!(
+            processor.data.len(),
+            ELF_FIXTURE.len(),
+            "patching must not resize the file"
+        );
+
+        // Walk the diff and classify every byte that moved.
+        let (reserved_vaddr, _) = elf_symbol(ELF_FIXTURE, ELF_PAYLOAD_SYMBOL).unwrap().unwrap();
+        let segments = elf_load_segments(ELF_FIXTURE).unwrap();
+        let reserved_offset = segments
+            .iter()
+            .find_map(|segment| segment.offset_of_vaddr(reserved_vaddr))
+            .unwrap() as usize;
+
+        for index in 0..processor.data.len() {
+            if processor.data[index] == ELF_FIXTURE[index] {
+                continue;
+            }
+            let in_reserved =
+                (reserved_offset..reserved_offset + payload.len()).contains(&index);
+            // data_size starts 12 bytes into the config, data_offset 16.
+            let in_config = (config_offset + 12..config_offset + 20).contains(&index);
+            assert!(
+                in_reserved || in_config,
+                "byte {index:#x} changed but is neither the reserved buffer nor the config"
+            );
+        }
+
+        // And the config has to point at the buffer, signed: on this fixture the
+        // buffer sits below the config.
+        let config_vaddr = segments
+            .iter()
+            .find_map(|segment| segment.vaddr_of_offset(config_offset as u64))
+            .unwrap();
+        assert_eq!(config.data_size as usize, payload.len());
+        assert_eq!(
+            (config_vaddr as i64 + config.data_offset as i64) as u64,
+            reserved_vaddr
+        );
+        assert_eq!(
+            &processor.data[reserved_offset..reserved_offset + payload.len()],
+            payload
+        );
     }
 
     #[test]
