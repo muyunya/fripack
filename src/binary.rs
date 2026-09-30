@@ -586,14 +586,20 @@ impl BinaryProcessor {
 
             info!("Replaced {} occurrences of keywords", replacements);
 
-            // Fix GNU_HASH as we changed the string table
-            let cloned_data = self.data.clone();
-            let mut obj = object::build::elf::Builder::read(cloned_data.as_slice())?;
-            obj.delete_orphan_dynamics();
-            obj.delete_orphan_symbols();
-            obj.set_section_sizes();
-            self.data = vec![];
-            obj.write(&mut self.data)?;
+            // Deliberately no rewrite here. The replacements above are same-length
+            // writes in place, so no section changes size and nothing becomes an
+            // orphan, which makes the rebuild that used to follow a no-op at best.
+            // In practice it was not: reading the file back through the ELF builder
+            // and writing it out again re-laid the file out, and the result
+            // segfaulted the dynamic loader on Linux while the version without it
+            // loaded and ran - the same class of damage as the program header table
+            // growing into .dynsym. The comment claimed it fixed GNU_HASH after the
+            // string table changed, but none of delete_orphan_dynamics,
+            // delete_orphan_symbols or set_section_sizes touches the hash table, so
+            // it never did that either. Symbol names in .dynstr no longer match the
+            // hashes in .gnu.hash, which only means lookups of the renamed names
+            // fail - the table's buckets and chains are offsets into .dynsym and
+            // stay structurally valid, so walking them is safe.
         }
 
         Ok(())
