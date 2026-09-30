@@ -85,6 +85,7 @@ impl FripackConfig {
                 entry: Some("main.js".to_string()),
                 xz: Some(false),
                 override_prebuild_file: None,
+                payload_url: None,
                 sign: None,
                 output_dir: None,
                 target_base_name: None,
@@ -110,6 +111,7 @@ impl FripackConfig {
                 entry: None,
                 xz: None,
                 override_prebuild_file: None,
+                payload_url: None,
                 sign: Some(SignConfig {
                     keystore: "C:\\Users\\YourUser\\.android\\debug.keystore".to_string(),
                     keystore_pass: "android".to_string(),
@@ -149,6 +151,7 @@ impl FripackConfig {
                 entry: None,
                 xz: None,
                 override_prebuild_file: Some("./libfripack-inject.so".to_string()),
+                payload_url: None,
                 sign: None,
                 output_dir: None,
                 target_base_name: None,
@@ -174,6 +177,7 @@ impl FripackConfig {
                 entry: Some("main.js".to_string()),
                 xz: Some(false),
                 override_prebuild_file: None,
+                payload_url: None,
                 output_dir: None,
                 target_base_name: None,
                 before_build: None,
@@ -209,6 +213,7 @@ impl FripackConfig {
                 entry: Some("main.js".to_string()),
                 xz: Some(false),
                 override_prebuild_file: None,
+                payload_url: None,
                 output_dir: None,
                 target_base_name: None,
                 before_build: None,
@@ -305,6 +310,12 @@ pub struct TargetConfig {
     pub xz: Option<bool>,
     #[serde(rename = "overridePrebuildFile")]
     pub override_prebuild_file: Option<String>,
+    /// Explicit URL to download the payload from, as an alternative to the
+    /// fripack-inject release convention. `{platform}` and `{ext}` are
+    /// substituted, e.g.
+    /// `https://github.com/OWNER/REPO/releases/download/v1.0.0/payload-{platform}.{ext}`
+    #[serde(rename = "payloadUrl")]
+    pub payload_url: Option<String>,
     pub sign: Option<SignConfig>,
     #[serde(rename = "outputDir")]
     pub output_dir: Option<String>,
@@ -427,6 +438,7 @@ pub struct ResolvedTarget {
     pub entry: Option<String>,
     pub xz: Option<bool>,
     pub override_prebuild_file: Option<String>,
+    pub payload_url: Option<String>,
     pub sign: Option<SignConfig>,
     pub output_dir: Option<String>,
     pub target_base_name: Option<String>,
@@ -451,6 +463,7 @@ impl ResolvedTarget {
             entry,
             xz,
             override_prebuild_file,
+            payload_url,
             sign,
             output_dir,
             target_base_name,

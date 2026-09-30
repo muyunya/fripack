@@ -86,6 +86,9 @@ The following options are available for all target types:
 - `platform`: Target platform (e.g., `android-arm64`, `windows-x86_64`).
   - Valid values: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`, `macos-arm64`, `macos-x86_64`
 - `version`: Version of your plugin.
+- `payloadUrl` (optional): Download the payload from this URL instead of the default fripack-inject release. `{platform}` and `{ext}` are substituted, so any release that publishes a compatible payload works, e.g.
+  `"payloadUrl": "https://github.com/std-microblock/chromatic/releases/download/v2.0.0/chromatic-injectee-v2.0.0-{platform}.{ext}"`
+- `overridePrebuildFile` (optional): Use a payload from a local file instead of downloading one.
 - `type`: Type of the target (defines the output format).
 - `inherit`: Key of another target to inherit configuration from.
 - `targetBaseName` (optional): Base name for output files (defaults to target key).

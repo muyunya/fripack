@@ -188,6 +188,11 @@ impl Builder {
             }
 
             fs::read(override_file).await?
+        } else if let Some(url_template) = &target.payload_url {
+            info!("→ Downloading payload from payloadUrl");
+            self.downloader
+                .download_payload_from_url(url_template, platform)
+                .await?
         } else {
             // Only needed when we actually have to download a payload, so a
             // target that overrides the prebuilt file does not have to declare it.

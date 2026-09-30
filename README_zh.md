@@ -82,6 +82,9 @@ fripack watch xposed
 - `platform`: 目标平台 (例如 `android-arm64`, `windows-x86_64`)。
   - 有效值: `android-arm32`, `android-arm64`, `android-x86`, `android-x64`, `windows-x64`, `linux-x64`, `macos-arm64`, `macos-x86_64`
 - `version`: 你的插件版本。
+- `payloadUrl` (可选): 从这个 URL 下载载荷，而不用默认的 fripack-inject release。`{platform}` 与 `{ext}` 会被替换，因此任何发布了兼容载荷的 release 都可以直接用，例如
+  `"payloadUrl": "https://github.com/std-microblock/chromatic/releases/download/v2.0.0/chromatic-injectee-v2.0.0-{platform}.{ext}"`
+- `overridePrebuildFile` (可选): 直接使用本地文件作为载荷，不进行下载。
 - `type`: 目标类型（定义了输出格式）。
 - `inherit`: 要继承配置的另一个目标的键名。
 - `targetBaseName` (可选): 输出文件的基础名称（默认为目标键名）。

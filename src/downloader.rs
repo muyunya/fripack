@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
@@ -217,6 +217,53 @@ impl Downloader {
         info!("→ Downloaded and cached zygisk loader for {}", abi);
 
         Ok(loader_data.to_vec())
+    }
+
+    /// Downloads a payload from an explicit URL template, as an alternative to
+    /// the fripack-inject release convention.
+    ///
+    /// `{platform}` and `{ext}` are substituted, so a target can point at any
+    /// release that publishes a compatible payload - for example chromatic's
+    /// injectee. The result is cached under the URL's file name.
+    pub async fn download_payload_from_url(
+        &self,
+        url_template: &str,
+        platform: &PlatformConfig,
+    ) -> Result<Vec<u8>> {
+        let url = url_template
+            .replace("{platform}", &platform.to_string())
+            .replace("{ext}", platform.platform.binary_ext());
+
+        let filename = url
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .context("payloadUrl does not end in a file name")?
+            .to_string();
+        let cache_path = self.cache_dir.join(&filename);
+
+        if cache_path.exists() {
+            info!("→ Loading from cache: {}", cache_path.display());
+            return Ok(fs::read(&cache_path).await?);
+        }
+
+        info!("→ Downloading payload: {url}");
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "Failed to download payload: HTTP {}: {}",
+                response.status(),
+                url
+            );
+        }
+
+        let data = response.bytes().await?.to_vec();
+        self.ensure_cache_dir().await?;
+        fs::write(&cache_path, &data).await?;
+        info!("→ Cached to: {}", cache_path.display());
+
+        Ok(data)
     }
 
     pub async fn download_prebuilt_file(
